@@ -84,21 +84,30 @@ GUIDANCE = (
 
 # ── REST API call ─────────────────────────────────────────────────────────────
 
-async def fetch_record(query: str) -> dict | None:
+async def fetch_record(query: str) -> list | dict | None:
     headers = {"Content-Type": "application/json"}
-    url     = f"{API_BASE_URL}/search"
-    params  = {"query": query}          # single param for both email & mobile
+    
+    # Correct way - directly append the search value
+    url = f"{API_BASE_URL}{query}"
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url, params=params, headers=headers)
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(url, headers=headers)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+
+            if isinstance(data, dict) and "data" in data:
+                result = data["data"]
+                # If it's a list of strings (as per API behavior)
+                if isinstance(result, list) and len(result) > 0 and isinstance(result[0], str):
+                    return result  # Return raw list of "Key: value" strings
+                return result
+            return data
     except httpx.HTTPStatusError as e:
-        logger.error("API HTTP error %s: %s", e.response.status_code, e.response.text)
+        logger.error(f"API error {e.response.status_code}: {e.response.text[:300]}")
         return None
     except Exception as e:
-        logger.error("API request failed: %s", e)
+        logger.error(f"API request failed: {e}")
         return None
 
 
