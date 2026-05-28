@@ -1,7 +1,7 @@
 import asyncio
 import logging
-import os
 import platform
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import httpx
@@ -24,9 +24,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Bot start time (for uptime calc) ─────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────────────────
 BOT_START_TIME: datetime = datetime.now(timezone.utc)
 TOTAL_QUERIES: int = 0
+
+# Rate limit: track last request time per user (simple in-memory)
+_last_request: dict[int, float] = defaultdict(float)
+RATE_LIMIT_SECONDS = 5          # min gap between requests per user
+API_RETRY_ATTEMPTS = 2          # retry once on 503
+API_RETRY_DELAY    = 3          # seconds between retries
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -38,23 +44,33 @@ def is_mobile(text: str) -> bool:
     digits = text.replace("+", "").replace(" ", "").replace("-", "")
     return digits.isdigit() and 7 <= len(digits) <= 15
 
-def format_record(record: dict) -> str:
+def format_record(record) -> str:
+    """Handle dict, list of strings, or list of dicts."""
     if not record:
         return "_(empty record)_"
-    lines = []
-    for key, value in record.items():
-        if value in (None, "", [], {}):
-            value = "—"
-        lines.append(f"• *{key}*: `{value}`")
-    return "\n".join(lines)
+
+    # List of "Key: value" strings returned by some APIs
+    if isinstance(record, list) and record and isinstance(record[0], str):
+        return "\n".join(f"• {line}" for line in record)
+
+    # Standard dict
+    if isinstance(record, dict):
+        lines = []
+        for key, value in record.items():
+            if value in (None, "", [], {}):
+                value = "—"
+            lines.append(f"• *{key}*: `{value}`")
+        return "\n".join(lines)
+
+    return str(record)
 
 def human_uptime(start: datetime) -> str:
-    delta = datetime.now(timezone.utc) - start
+    delta   = datetime.now(timezone.utc) - start
     days    = delta.days
     hours   = delta.seconds // 3600
     minutes = (delta.seconds % 3600) // 60
     seconds = delta.seconds % 60
-    parts = []
+    parts   = []
     if days:    parts.append(f"{days}d")
     if hours:   parts.append(f"{hours}h")
     if minutes: parts.append(f"{minutes}m")
@@ -64,8 +80,7 @@ def human_uptime(start: datetime) -> str:
 def auth_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ALLOWED_USER_IDS:
-            uid = update.effective_user.id
-            if uid not in ALLOWED_USER_IDS:
+            if update.effective_user.id not in ALLOWED_USER_IDS:
                 await update.message.reply_text("⛔ You are not authorised to use this bot.")
                 return
         return await func(update, context)
@@ -73,7 +88,7 @@ def auth_required(func):
 
 GUIDANCE = (
     "📖 *How to use:*\n\n"
-    "Just send an *email* or *mobile number* — I'll fetch everything from the database.\n\n"
+    "Send an *email* or *mobile number* and I'll fetch everything from the database.\n\n"
     "`john@example.com`\n"
     "`+919876543210`\n\n"
     "Commands:\n"
@@ -82,40 +97,72 @@ GUIDANCE = (
 )
 
 
-# ── REST API call ─────────────────────────────────────────────────────────────
+# ── API call ──────────────────────────────────────────────────────────────────
 
-async def fetch_record(query: str) -> list | dict | None:
+async def fetch_record(query: str) -> tuple[list | dict | None, str | None]:
+    """
+    Returns (data, error_message).
+    URL format: {API_BASE_URL}/search={query}
+    Retries once on 503. Returns friendly error strings on failure.
+    """
+    url     = f"{API_BASE_URL}/search={query}"
     headers = {"Content-Type": "application/json"}
-    
-    # Correct way - directly append the search value
-    url = f"{API_BASE_URL}{query}"
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            data = response.json()
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        try:
+            # Small delay before every API call to be gentle on the server
+            await asyncio.sleep(1)
 
-            if isinstance(data, dict) and "data" in data:
-                result = data["data"]
-                # If it's a list of strings (as per API behavior)
-                if isinstance(result, list) and len(result) > 0 and isinstance(result[0], str):
-                    return result  # Return raw list of "Key: value" strings
-                return result
-            return data
-    except httpx.HTTPStatusError as e:
-        logger.error(f"API error {e.response.status_code}: {e.response.text[:300]}")
-        return None
-    except Exception as e:
-        logger.error(f"API request failed: {e}")
-        return None
+            async with httpx.AsyncClient(
+                timeout=20,
+                follow_redirects=True,
+            ) as client:
+                response = await client.get(url, headers=headers)
+
+                # DDoS lockdown
+                if response.status_code == 503:
+                    body = response.text
+                    wait = "30"
+                    # Try to extract wait seconds from message if present
+                    import re
+                    m = re.search(r"(\d+)\s*[sS]", body)
+                    if m:
+                        wait = m.group(1)
+                    if attempt < API_RETRY_ATTEMPTS:
+                        logger.warning("503 on attempt %d, retrying in %ds…", attempt, API_RETRY_DELAY)
+                        await asyncio.sleep(API_RETRY_DELAY)
+                        continue
+                    return None, f"⚠️ API is under heavy load (DDoS protection). Please try again in *{wait} seconds*."
+
+                response.raise_for_status()
+                data = response.json()
+
+                # Unwrap {"data": [...]} envelope if present
+                if isinstance(data, dict) and "data" in data:
+                    return data["data"], None
+                return data, None
+
+        except httpx.TimeoutException:
+            if attempt < API_RETRY_ATTEMPTS:
+                await asyncio.sleep(API_RETRY_DELAY)
+                continue
+            return None, "⏱ Request timed out. Please try again."
+
+        except httpx.HTTPStatusError as e:
+            logger.error("API HTTP %s: %s", e.response.status_code, e.response.text[:200])
+            return None, f"❌ API returned error {e.response.status_code}. Please try again later."
+
+        except Exception as e:
+            logger.error("API request failed: %s", e)
+            return None, "❌ Could not reach the API. Please try again later."
+
+    return None, "❌ API unavailable after retries. Please try again later."
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
 
 @auth_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """First-ever message: welcome banner + guidance."""
     name = update.effective_user.first_name or "there"
     text = (
         f"👋 *Welcome, {name}!*\n\n"
@@ -127,7 +174,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @auth_required
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Only guidance, no welcome banner."""
     await update.message.reply_text(GUIDANCE, parse_mode="Markdown")
 
 
@@ -149,39 +195,60 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TOTAL_QUERIES
     query = update.message.text.strip()
+    uid   = update.effective_user.id
 
+    # Validate input
     if not (is_email(query) or is_mobile(query)):
         await update.message.reply_text(
-            "⚠️ Send a valid *email address* or *mobile number*.",
+            "⚠️ Send a valid *email address* or *mobile number*.\n\n"
+            "Examples:\n`john@example.com`\n`+919876543210`",
             parse_mode="Markdown",
         )
         return
 
+    # Per-user rate limit
+    now = asyncio.get_event_loop().time()
+    gap = now - _last_request[uid]
+    if gap < RATE_LIMIT_SECONDS:
+        wait = int(RATE_LIMIT_SECONDS - gap) + 1
+        await update.message.reply_text(
+            f"⏳ Please wait *{wait}s* before sending another request.",
+            parse_mode="Markdown",
+        )
+        return
+    _last_request[uid] = now
+
+    # Show typing while fetching
     await context.bot.send_chat_action(update.effective_chat.id, action="typing")
-    record = await fetch_record(query)
+
+    data, error = await fetch_record(query)
     TOTAL_QUERIES += 1
 
-    if record is None:
-        await update.message.reply_text("❌ API error. Please try again later.")
+    # API error
+    if error:
+        await update.message.reply_text(error, parse_mode="Markdown")
         return
 
-    if isinstance(record, list):
-        if not record:
-            await update.message.reply_text(f"🔍 No records found for `{query}`.", parse_mode="Markdown")
-            return
-        context.user_data["results"] = record
-        context.user_data["page"]    = 0
-        await send_page(update, context, record, 0, query)
+    # No results
+    if not data:
+        await update.message.reply_text(
+            f"🔍 No record found for `{query}`.",
+            parse_mode="Markdown",
+        )
         return
 
-    if not record:
-        await update.message.reply_text(f"🔍 No record found for `{query}`.", parse_mode="Markdown")
+    # Multiple records → paginate
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        context.user_data["results"] = data
+        context.user_data["query"]   = query
+        await send_page(update, context, data, 0, query)
         return
 
+    # Single result (dict or list of strings)
     reply = (
         f"✅ *Record found* for `{query}`\n"
         f"{'─' * 30}\n"
-        f"{format_record(record)}"
+        f"{format_record(data)}"
     )
     await update.message.reply_text(reply, parse_mode="Markdown")
 
@@ -190,7 +257,7 @@ async def send_page(update, context, records, page, query=""):
     total  = len(records)
     record = records[page]
     text = (
-        f"✅ *Result {page + 1} of {total}* for `{query or '?'}`\n"
+        f"✅ *Result {page + 1} of {total}* for `{query}`\n"
         f"{'─' * 30}\n"
         f"{format_record(record)}"
     )
@@ -212,8 +279,9 @@ async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     page    = int(q.data.split(":")[1])
     records = context.user_data.get("results", [])
+    query   = context.user_data.get("query", "")
     if records:
-        await send_page(update, context, records, page)
+        await send_page(update, context, records, page, query)
 
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,7 +291,7 @@ async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Health-check HTTP server ──────────────────────────────────────────────────
 
 async def health_handler(request: web.Request) -> web.Response:
-    payload = {
+    return web.json_response({
         "status":        "ok",
         "bot":           "Drogon",
         "started_at":    BOT_START_TIME.isoformat(),
@@ -231,8 +299,7 @@ async def health_handler(request: web.Request) -> web.Response:
         "queries_total": TOTAL_QUERIES,
         "python":        platform.python_version(),
         "platform":      platform.system(),
-    }
-    return web.json_response(payload)
+    })
 
 
 async def run_health_server():
@@ -241,8 +308,7 @@ async def run_health_server():
     app.router.add_get("/",       health_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
     logger.info("Health server listening on port %s", PORT)
 
 
@@ -251,7 +317,12 @@ async def run_health_server():
 async def main():
     await run_health_server()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(False)   # prevents duplicate processing
+        .build()
+    )
 
     application.add_handler(CommandHandler("start",  start))
     application.add_handler(CommandHandler("help",   help_cmd))
@@ -264,7 +335,10 @@ async def main():
     async with application:
         await application.initialize()
         await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
+        await application.updater.start_polling(
+            drop_pending_updates=True,   # drop queued msgs from when bot was offline
+            allowed_updates=["message", "callback_query"],
+        )
         await asyncio.Event().wait()
 
 
