@@ -1,15 +1,19 @@
 services:
   - type: web
-    name: lookup-bot
+    name: drogon
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        sync: false          # set this manually in Render dashboard
+        sync: false
       - key: API_BASE_URL
+        sync: false
+      - key: CHANNEL_ID
         sync: false
       - key: ALLOWED_USER_IDS
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: PORT
-        generateValue: false # Render sets this automatically
+        generateValue: false

@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import platform
+import re
 from collections import defaultdict
 from datetime import datetime, timezone
 from html import escape
 
+import asyncpg
 import httpx
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,7 +19,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from config import BOT_TOKEN, API_BASE_URL, ALLOWED_USER_IDS, PORT, CHANNEL_ID
+from config import BOT_TOKEN, API_BASE_URL, ALLOWED_USER_IDS, PORT, CHANNEL_ID, DATABASE_URL
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,6 +36,71 @@ RATE_LIMIT_SECONDS = 5
 API_RETRY_ATTEMPTS = 2
 API_RETRY_DELAY    = 3
 
+# DB pool (set on startup)
+db_pool: asyncpg.Pool | None = None
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
+
+async def init_db(pool: asyncpg.Pool):
+    """Create tables if they don't exist."""
+    await pool.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id     BIGINT PRIMARY KEY,
+            username        TEXT,
+            first_name      TEXT,
+            joined_at       TIMESTAMPTZ DEFAULT NOW(),
+            last_seen       TIMESTAMPTZ DEFAULT NOW(),
+            total_lookups   INTEGER DEFAULT 0
+        )
+    """)
+    logger.info("DB tables ready")
+
+async def upsert_user(user):
+    """Insert new user or update last_seen on every interaction."""
+    if not db_pool:
+        return
+    try:
+        await db_pool.execute("""
+            INSERT INTO users (telegram_id, username, first_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (telegram_id) DO UPDATE
+                SET username   = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_seen  = NOW()
+        """, user.id, user.username, user.first_name)
+    except Exception as e:
+        logger.error("upsert_user failed: %s", e)
+
+async def increment_lookup(user_id: int):
+    """Bump lookup counter for a user."""
+    if not db_pool:
+        return
+    try:
+        await db_pool.execute("""
+            UPDATE users SET total_lookups = total_lookups + 1,
+                             last_seen     = NOW()
+            WHERE telegram_id = $1
+        """, user_id)
+    except Exception as e:
+        logger.error("increment_lookup failed: %s", e)
+
+async def get_stats() -> dict:
+    """Return aggregate stats for /status."""
+    if not db_pool:
+        return {}
+    try:
+        row = await db_pool.fetchrow("""
+            SELECT COUNT(*)                         AS total_users,
+                   COALESCE(SUM(total_lookups), 0)  AS total_lookups,
+                   MAX(last_seen)                   AS last_active
+            FROM users
+        """)
+        return dict(row)
+    except Exception as e:
+        logger.error("get_stats failed: %s", e)
+        return {}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -45,7 +112,6 @@ def is_mobile(text: str) -> bool:
     return digits.isdigit() and 7 <= len(digits) <= 15
 
 def normalize_mobile(text: str) -> str:
-    """Auto-add 91 prefix for 10-digit Indian numbers."""
     digits = text.replace("+", "").replace(" ", "").replace("-", "")
     if len(digits) == 10 and digits.isdigit():
         return "91" + digits
@@ -83,10 +149,9 @@ async def send_html(update: Update, text: str, **kwargs):
     await update.message.reply_text(text, parse_mode="HTML", **kwargs)
 
 
-# ── Channel membership check ──────────────────────────────────────────────────
+# ── Channel membership ────────────────────────────────────────────────────────
 
 async def is_member(bot, user_id: int) -> bool:
-    """Returns True if user is a member/admin/creator of CHANNEL_ID."""
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
         return member.status in ("member", "administrator", "creator")
@@ -97,40 +162,29 @@ async def is_member(bot, user_id: int) -> bool:
         return False
 
 def join_keyboard() -> InlineKeyboardMarkup:
-    """Inline keyboard with Join + Verify buttons."""
-    channel = CHANNEL_ID if CHANNEL_ID.startswith("@") else "the channel"
-    buttons = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}")],
         [InlineKeyboardButton("✅ Verify Membership", callback_data="verify")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 async def prompt_join(update: Update):
-    """Send the join-channel prompt."""
-    channel = CHANNEL_ID if CHANNEL_ID.startswith("@") else "our channel"
     text = (
         "🔒 <b>Access Restricted</b>\n\n"
-        f"You must join {escape(channel)} to use this bot.\n\n"
+        f"You must join {escape(CHANNEL_ID)} to use this bot.\n\n"
         "1️⃣ Click <b>Join Channel</b>\n"
         "2️⃣ Click <b>Verify Membership</b>"
     )
     if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text, parse_mode="HTML", reply_markup=join_keyboard()
-        )
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=join_keyboard())
     else:
-        await update.message.reply_text(
-            text, parse_mode="HTML", reply_markup=join_keyboard()
-        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=join_keyboard())
 
 def auth_required(func):
-    """Check ALLOWED_USER_IDS whitelist (if set) AND channel membership."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        # Hard whitelist check (admins bypass channel check)
+        await upsert_user(user)
         if ALLOWED_USER_IDS and user.id in ALLOWED_USER_IDS:
             return await func(update, context)
-        # Channel membership check
         if not await is_member(context.bot, user.id):
             await prompt_join(update)
             return
@@ -151,7 +205,6 @@ async def fetch_record(query: str) -> tuple[list | dict | None, str | None]:
                 response = await client.get(url, headers=headers)
 
                 if response.status_code == 503:
-                    import re
                     m    = re.search(r"(\d+)\s*[sS]", response.text)
                     wait = m.group(1) if m else "30"
                     if attempt < API_RETRY_ATTEMPTS:
@@ -180,40 +233,60 @@ async def fetch_record(query: str) -> tuple[list | dict | None, str | None]:
     return None, "❌ API unavailable after retries."
 
 
-# ── Telegram handlers ─────────────────────────────────────────────────────────
+# ── Messages ──────────────────────────────────────────────────────────────────
+
+def welcome_msg(name: str) -> str:
+    return (
+        f"👋 <b>Welcome, {name}!</b>\n\n"
+        "I'm <b>Drogon</b> — your free info bot.\n\n"
+        "📖 <b>How to use:</b>\n\n"
+        "Just send an email or mobile number — I'll fetch everything from the database.\n\n"
+        "<code>user@example.com</code>\n"
+        "<code>9876543210</code>\n\n"
+        "Commands:\n"
+        "  /help   — show this guide"
+    )
 
 GUIDANCE = (
     "📖 <b>How to use:</b>\n\n"
-    "Send an <b>email</b> or <b>mobile number</b> and I'll fetch everything from the database.\n\n"
+    "Send an email or mobile number and I'll fetch everything from the database.\n\n"
     "<code>john@example.com</code>\n"
-    "<code>+919876543210</code>\n\n"
-    "Commands:\n"
-    "  /help   — show this guide\n"
-    "  /status — bot uptime &amp; stats"
+    "<code>+919876543210</code>"
 )
+
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 @auth_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = escape(update.effective_user.first_name or "there")
-    await send_html(update,
-        f"👋 <b>Welcome, {name}!</b>\n\n"
-        "I'm <b>Drogon</b> 🐉 — your personal database lookup bot.\n\n"
-        + GUIDANCE
-    )
+    name = escape(update.effective_user.first_name or "User")
+    await send_html(update, welcome_msg(name))
 
 @auth_required
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(update, GUIDANCE)
 
-@auth_required
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Hidden — only ALLOWED_USER_IDS can see it, silently ignored for others
+    if not ALLOWED_USER_IDS or update.effective_user.id not in ALLOWED_USER_IDS:
+        return
+
     uptime  = human_uptime(BOT_START_TIME)
     started = BOT_START_TIME.strftime("%Y-%m-%d %H:%M:%S UTC")
+    stats   = await get_stats()
+
+    total_users   = stats.get("total_users",   "—")
+    total_lookups = stats.get("total_lookups", "—")
+    last_active   = stats.get("last_active")
+    last_active_str = last_active.strftime("%Y-%m-%d %H:%M UTC") if last_active else "—"
+
     await send_html(update,
-        "🟢 <b>Drogon is running</b>\n\n"
+        "🟢 <b>Drogon Status</b>\n\n"
         f"🕐 <b>Started:</b> <code>{started}</code>\n"
-        f"⏱ <b>Uptime:</b> <code>{uptime}</code>\n"
-        f"🔍 <b>Queries served:</b> <code>{TOTAL_QUERIES}</code>\n"
+        f"⏱ <b>Uptime:</b> <code>{uptime}</code>\n\n"
+        f"👥 <b>Total users:</b> <code>{total_users}</code>\n"
+        f"🔍 <b>Total lookups:</b> <code>{total_lookups}</code>\n"
+        f"🕓 <b>Last active:</b> <code>{last_active_str}</code>\n\n"
         f"🐍 <b>Python:</b> <code>{platform.python_version()}</code>"
     )
 
@@ -230,7 +303,6 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Normalize: auto-add 91 prefix for 10-digit Indian numbers
     if is_mobile(query):
         query = normalize_mobile(query)
 
@@ -243,7 +315,9 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(update.effective_chat.id, action="typing")
     data, error = await fetch_record(query)
+
     TOTAL_QUERIES += 1
+    await increment_lookup(uid)
 
     if error:
         await send_html(update, error)
@@ -266,7 +340,7 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_page(update, context, records, page, query=""):
-    total  = len(records)
+    total = len(records)
     text = (
         f"✅ <b>Result {page + 1} of {total}</b> for <code>{escape(query)}</code>\n"
         f"{'─' * 30}\n"
@@ -296,12 +370,13 @@ async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User clicked ✅ Verify Membership — re-check and respond."""
     q = update.callback_query
     await q.answer()
+    user = update.effective_user
+    await upsert_user(user)
 
-    if await is_member(context.bot, update.effective_user.id):
-        name = escape(update.effective_user.first_name or "there")
+    if await is_member(context.bot, user.id):
+        name = escape(user.first_name or "User")
         await q.edit_message_text(
             f"✅ <b>Verified, {name}!</b>\n\n"
             "You now have full access. Send an email or mobile number to search.\n\n"
@@ -347,7 +422,17 @@ async def run_health_server():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
+    global db_pool
+
     await run_health_server()
+
+    # Connect to Neon DB
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        await init_db(db_pool)
+        logger.info("Database connected")
+    except Exception as e:
+        logger.error("Database connection failed: %s — running without DB", e)
 
     application = (
         ApplicationBuilder()
