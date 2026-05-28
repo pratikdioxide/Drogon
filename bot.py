@@ -105,7 +105,7 @@ async def fetch_record(query: str) -> tuple[list | dict | None, str | None]:
     URL format: {API_BASE_URL}/search={query}
     Retries once on 503. Returns friendly error strings on failure.
     """
-    url     = f"{API_BASE_URL}/search={query}"
+    url     = f"{API_BASE_URL}{query}"
     headers = {"Content-Type": "application/json"}
 
     for attempt in range(1, API_RETRY_ATTEMPTS + 1):
