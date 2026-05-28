@@ -8,6 +8,7 @@ from html import escape
 import httpx
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -16,7 +17,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from config import BOT_TOKEN, API_BASE_URL, ALLOWED_USER_IDS, PORT
+from config import BOT_TOKEN, API_BASE_URL, ALLOWED_USER_IDS, PORT, CHANNEL_ID
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,7 +35,7 @@ API_RETRY_ATTEMPTS = 2
 API_RETRY_DELAY    = 3
 
 
-# ── Helpers ───────────────────────────────────────────────────────────name────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def is_email(text: str) -> bool:
     return "@" in text and "." in text.split("@")[-1]
@@ -44,25 +45,18 @@ def is_mobile(text: str) -> bool:
     return digits.isdigit() and 7 <= len(digits) <= 15
 
 def fmt(value) -> str:
-    """Escape a single value for safe HTML output."""
     return escape(str(value)) if value not in (None, "", [], {}) else "—"
 
 def format_record(record) -> str:
-    """Format API response as safe HTML — handles dict, list of strings, list of dicts."""
     if not record:
         return "<i>(empty record)</i>"
-
-    # List of "Key: value" strings
     if isinstance(record, list) and record and isinstance(record[0], str):
         return "\n".join(f"• {escape(line)}" for line in record)
-
-    # Dict
     if isinstance(record, dict):
-        lines = []
-        for key, value in record.items():
-            lines.append(f"• <b>{escape(str(key))}</b>: <code>{fmt(value)}</code>")
-        return "\n".join(lines)
-
+        return "\n".join(
+            f"• <b>{escape(str(k))}</b>: <code>{fmt(v)}</code>"
+            for k, v in record.items()
+        )
     return escape(str(record))
 
 def human_uptime(start: datetime) -> str:
@@ -78,14 +72,108 @@ def human_uptime(start: datetime) -> str:
     parts.append(f"{seconds}s")
     return " ".join(parts)
 
+async def send_html(update: Update, text: str, **kwargs):
+    await update.message.reply_text(text, parse_mode="HTML", **kwargs)
+
+
+# ── Channel membership check ──────────────────────────────────────────────────
+
+async def is_member(bot, user_id: int) -> bool:
+    """Returns True if user is a member/admin/creator of CHANNEL_ID."""
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except BadRequest:
+        return False
+    except Exception as e:
+        logger.error("Membership check failed: %s", e)
+        return False
+
+def join_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard with Join + Verify buttons."""
+    channel = CHANNEL_ID if CHANNEL_ID.startswith("@") else "the channel"
+    buttons = [
+        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}")],
+        [InlineKeyboardButton("✅ Verify Membership", callback_data="verify")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+async def prompt_join(update: Update):
+    """Send the join-channel prompt."""
+    channel = CHANNEL_ID if CHANNEL_ID.startswith("@") else "our channel"
+    text = (
+        "🔒 <b>Access Restricted</b>\n\n"
+        f"You must join {escape(channel)} to use this bot.\n\n"
+        "1️⃣ Click <b>Join Channel</b>\n"
+        "2️⃣ Click <b>Verify Membership</b>"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=join_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            text, parse_mode="HTML", reply_markup=join_keyboard()
+        )
+
 def auth_required(func):
+    """Check ALLOWED_USER_IDS whitelist (if set) AND channel membership."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if ALLOWED_USER_IDS:
-            if update.effective_user.id not in ALLOWED_USER_IDS:
-                await update.message.reply_text("⛔ You are not authorised to use this bot.")
-                return
+        user = update.effective_user
+        # Hard whitelist check (admins bypass channel check)
+        if ALLOWED_USER_IDS and user.id in ALLOWED_USER_IDS:
+            return await func(update, context)
+        # Channel membership check
+        if not await is_member(context.bot, user.id):
+            await prompt_join(update)
+            return
         return await func(update, context)
     return wrapper
+
+
+# ── API call ──────────────────────────────────────────────────────────────────
+
+async def fetch_record(query: str) -> tuple[list | dict | None, str | None]:
+    url     = f"{API_BASE_URL}{query}"
+    headers = {"Content-Type": "application/json"}
+
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        try:
+            await asyncio.sleep(1)
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                response = await client.get(url, headers=headers)
+
+                if response.status_code == 503:
+                    import re
+                    m    = re.search(r"(\d+)\s*[sS]", response.text)
+                    wait = m.group(1) if m else "30"
+                    if attempt < API_RETRY_ATTEMPTS:
+                        await asyncio.sleep(API_RETRY_DELAY)
+                        continue
+                    return None, f"⚠️ API is under heavy load.\nPlease try again in <b>{wait} seconds</b>."
+
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict) and "data" in data:
+                    return data["data"], None
+                return data, None
+
+        except httpx.TimeoutException:
+            if attempt < API_RETRY_ATTEMPTS:
+                await asyncio.sleep(API_RETRY_DELAY)
+                continue
+            return None, "⏱ Request timed out. Please try again."
+        except httpx.HTTPStatusError as e:
+            logger.error("API HTTP %s: %s", e.response.status_code, e.response.text[:200])
+            return None, f"❌ API error <code>{e.response.status_code}</code>. Please try again later."
+        except Exception as e:
+            logger.error("API request failed: %s", e)
+            return None, "❌ Could not reach the API. Please try again later."
+
+    return None, "❌ API unavailable after retries."
+
+
+# ── Telegram handlers ─────────────────────────────────────────────────────────
 
 GUIDANCE = (
     "📖 <b>How to use:</b>\n\n"
@@ -97,91 +185,30 @@ GUIDANCE = (
     "  /status — bot uptime &amp; stats"
 )
 
-
-# ── API call ──────────────────────────────────────────────────────────────────
-
-async def fetch_record(query: str) -> tuple[list | dict | None, str | None]:
-    """Returns (data, error_html). URL: {API_BASE_URL}{query}"""
-    url     = f"{API_BASE_URL}{query}"
-    headers = {"Content-Type": "application/json"}
-
-    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
-        try:
-            await asyncio.sleep(1)  # gentle delay before every call
-
-            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-                response = await client.get(url, headers=headers)
-
-                if response.status_code == 503:
-                    import re
-                    m    = re.search(r"(\d+)\s*[sS]", response.text)
-                    wait = m.group(1) if m else "30"
-                    if attempt < API_RETRY_ATTEMPTS:
-                        logger.warning("503 attempt %d, retrying in %ds…", attempt, API_RETRY_DELAY)
-                        await asyncio.sleep(API_RETRY_DELAY)
-                        continue
-                    return None, f"⚠️ API is under heavy load (DDoS protection).\nPlease try again in <b>{wait} seconds</b>."
-
-                response.raise_for_status()
-                data = response.json()
-
-                if isinstance(data, dict) and "data" in data:
-                    return data["data"], None
-                return data, None
-
-        except httpx.TimeoutException:
-            if attempt < API_RETRY_ATTEMPTS:
-                await asyncio.sleep(API_RETRY_DELAY)
-                continue
-            return None, "⏱ Request timed out. Please try again."
-
-        except httpx.HTTPStatusError as e:
-            logger.error("API HTTP %s: %s", e.response.status_code, e.response.text[:200])
-            return None, f"❌ API returned error <code>{e.response.status_code}</code>. Please try again later."
-
-        except Exception as e:
-            logger.error("API request failed: %s", e)
-            return None, "❌ Could not reach the API. Please try again later."
-
-    return None, "❌ API unavailable after retries. Please try again later."
-
-
-# ── Telegram handlers ─────────────────────────────────────────────────────────
-
-async def send_html(update: Update, text: str, **kwargs):
-    """Helper — always sends with parse_mode=HTML."""
-    await update.message.reply_text(text, parse_mode="HTML", **kwargs)
-
-
 @auth_required
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = escape(update.effective_user.first_name or "there")
-    text = (
+    await send_html(update,
         f"👋 <b>Welcome, {name}!</b>\n\n"
         "I'm <b>Drogon</b> 🐉 — your personal database lookup bot.\n\n"
         + GUIDANCE
     )
-    await send_html(update, text)
-
 
 @auth_required
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(update, GUIDANCE)
 
-
 @auth_required
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uptime  = human_uptime(BOT_START_TIME)
     started = BOT_START_TIME.strftime("%Y-%m-%d %H:%M:%S UTC")
-    text = (
+    await send_html(update,
         "🟢 <b>Drogon is running</b>\n\n"
         f"🕐 <b>Started:</b> <code>{started}</code>\n"
         f"⏱ <b>Uptime:</b> <code>{uptime}</code>\n"
         f"🔍 <b>Queries served:</b> <code>{TOTAL_QUERIES}</code>\n"
         f"🐍 <b>Python:</b> <code>{platform.python_version()}</code>"
     )
-    await send_html(update, text)
-
 
 @auth_required
 async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -196,51 +223,43 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Per-user rate limit
     now = asyncio.get_event_loop().time()
-    gap = now - _last_request[uid]
-    if gap < RATE_LIMIT_SECONDS:
-        wait = int(RATE_LIMIT_SECONDS - gap) + 1
-        await send_html(update, f"⏳ Please wait <b>{wait}s</b> before sending another request.")
+    if now - _last_request[uid] < RATE_LIMIT_SECONDS:
+        wait = int(RATE_LIMIT_SECONDS - (now - _last_request[uid])) + 1
+        await send_html(update, f"⏳ Please wait <b>{wait}s</b> before the next request.")
         return
     _last_request[uid] = now
 
     await context.bot.send_chat_action(update.effective_chat.id, action="typing")
-
     data, error = await fetch_record(query)
     TOTAL_QUERIES += 1
 
     if error:
         await send_html(update, error)
         return
-
     if not data:
         await send_html(update, f"🔍 No record found for <code>{escape(query)}</code>.")
         return
 
-    # Multiple dict records → paginate
     if isinstance(data, list) and data and isinstance(data[0], dict):
         context.user_data["results"] = data
         context.user_data["query"]   = query
         await send_page(update, context, data, 0, query)
         return
 
-    # Single result
-    reply = (
+    await send_html(update,
         f"✅ <b>Record found</b> for <code>{escape(query)}</code>\n"
         f"{'─' * 30}\n"
         f"{format_record(data)}"
     )
-    await send_html(update, reply)
 
 
 async def send_page(update, context, records, page, query=""):
     total  = len(records)
-    record = records[page]
     text = (
         f"✅ <b>Result {page + 1} of {total}</b> for <code>{escape(query)}</code>\n"
         f"{'─' * 30}\n"
-        f"{format_record(record)}"
+        f"{format_record(records[page])}"
     )
     buttons = []
     if page > 0:
@@ -265,6 +284,28 @@ async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_page(update, context, records, page, query)
 
 
+async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User clicked ✅ Verify Membership — re-check and respond."""
+    q = update.callback_query
+    await q.answer()
+
+    if await is_member(context.bot, update.effective_user.id):
+        name = escape(update.effective_user.first_name or "there")
+        await q.edit_message_text(
+            f"✅ <b>Verified, {name}!</b>\n\n"
+            "You now have full access. Send an email or mobile number to search.\n\n"
+            + GUIDANCE,
+            parse_mode="HTML",
+        )
+    else:
+        await q.edit_message_text(
+            "❌ <b>Not a member yet.</b>\n\n"
+            "Please join the channel first, then click <b>Verify</b> again.",
+            parse_mode="HTML",
+            reply_markup=join_keyboard(),
+        )
+
+
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Unknown command. Use /help to see usage.")
 
@@ -281,7 +322,6 @@ async def health_handler(request: web.Request) -> web.Response:
         "python":        platform.python_version(),
         "platform":      platform.system(),
     })
-
 
 async def run_health_server():
     app = web.Application()
@@ -308,7 +348,8 @@ async def main():
     application.add_handler(CommandHandler("start",  start))
     application.add_handler(CommandHandler("help",   help_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
-    application.add_handler(CallbackQueryHandler(paginate, pattern=r"^page:\d+$"))
+    application.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify$"))
+    application.add_handler(CallbackQueryHandler(paginate,        pattern=r"^page:\d+$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
