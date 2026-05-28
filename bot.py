@@ -44,6 +44,13 @@ def is_mobile(text: str) -> bool:
     digits = text.replace("+", "").replace(" ", "").replace("-", "")
     return digits.isdigit() and 7 <= len(digits) <= 15
 
+def normalize_mobile(text: str) -> str:
+    """Auto-add 91 prefix for 10-digit Indian numbers."""
+    digits = text.replace("+", "").replace(" ", "").replace("-", "")
+    if len(digits) == 10 and digits.isdigit():
+        return "91" + digits
+    return digits
+
 def fmt(value) -> str:
     return escape(str(value)) if value not in (None, "", [], {}) else "—"
 
@@ -222,6 +229,10 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Examples:\n<code>john@example.com</code>\n<code>+919876543210</code>"
         )
         return
+
+    # Normalize: auto-add 91 prefix for 10-digit Indian numbers
+    if is_mobile(query):
+        query = normalize_mobile(query)
 
     now = asyncio.get_event_loop().time()
     if now - _last_request[uid] < RATE_LIMIT_SECONDS:
