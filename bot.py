@@ -2,12 +2,14 @@ import asyncio
 import logging
 import platform
 import re
+import ssl
 from collections import defaultdict
 from datetime import datetime, timezone
 from html import escape
+from urllib.parse import urlparse
 
-import asyncpg
 import httpx
+import pg8000.native
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -36,69 +38,98 @@ RATE_LIMIT_SECONDS = 5
 API_RETRY_ATTEMPTS = 2
 API_RETRY_DELAY    = 3
 
-# DB pool (set on startup)
-db_pool: asyncpg.Pool | None = None
 
+# ── Database (pg8000 — pure Python, no compilation) ───────────────────────────
 
-# ── Database ──────────────────────────────────────────────────────────────────
+def _get_conn() -> pg8000.native.Connection:
+    """Open a fresh DB connection from DATABASE_URL."""
+    p       = urlparse(DATABASE_URL)
+    db_name = p.path.lstrip("/").split("?")[0]
+    ssl_ctx = ssl.create_default_context()
+    return pg8000.native.Connection(
+        user=p.username,
+        password=p.password,
+        host=p.hostname,
+        port=p.port or 5432,
+        database=db_name,
+        ssl_context=ssl_ctx,
+    )
 
-async def init_db(pool: asyncpg.Pool):
-    """Create tables if they don't exist."""
-    await pool.execute("""
+def _init_db_sync():
+    conn = _get_conn()
+    conn.run("""
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id     BIGINT PRIMARY KEY,
-            username        TEXT,
-            first_name      TEXT,
-            joined_at       TIMESTAMPTZ DEFAULT NOW(),
-            last_seen       TIMESTAMPTZ DEFAULT NOW(),
-            total_lookups   INTEGER DEFAULT 0
+            telegram_id   BIGINT PRIMARY KEY,
+            username      TEXT,
+            first_name    TEXT,
+            joined_at     TIMESTAMPTZ DEFAULT NOW(),
+            last_seen     TIMESTAMPTZ DEFAULT NOW(),
+            total_lookups INTEGER DEFAULT 0
         )
     """)
+    conn.close()
+
+def _upsert_user_sync(user_id: int, username: str | None, first_name: str | None):
+    conn = _get_conn()
+    conn.run("""
+        INSERT INTO users (telegram_id, username, first_name)
+        VALUES (:uid, :uname, :fname)
+        ON CONFLICT (telegram_id) DO UPDATE
+            SET username   = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_seen  = NOW()
+    """, uid=user_id, uname=username, fname=first_name)
+    conn.close()
+
+def _increment_lookup_sync(user_id: int):
+    conn = _get_conn()
+    conn.run("""
+        UPDATE users
+        SET total_lookups = total_lookups + 1,
+            last_seen     = NOW()
+        WHERE telegram_id = :uid
+    """, uid=user_id)
+    conn.close()
+
+def _get_stats_sync() -> dict:
+    conn = _get_conn()
+    rows = conn.run("""
+        SELECT COUNT(*) AS total_users,
+               COALESCE(SUM(total_lookups), 0) AS total_lookups,
+               MAX(last_seen) AS last_active
+        FROM users
+    """)
+    conn.close()
+    if rows:
+        return {
+            "total_users":   rows[0][0],
+            "total_lookups": rows[0][1],
+            "last_active":   rows[0][2],
+        }
+    return {}
+
+# Async wrappers (run sync DB calls in a thread)
+async def init_db():
+    await asyncio.to_thread(_init_db_sync)
     logger.info("DB tables ready")
 
 async def upsert_user(user):
-    """Insert new user or update last_seen on every interaction."""
-    if not db_pool:
-        return
     try:
-        await db_pool.execute("""
-            INSERT INTO users (telegram_id, username, first_name)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (telegram_id) DO UPDATE
-                SET username   = EXCLUDED.username,
-                    first_name = EXCLUDED.first_name,
-                    last_seen  = NOW()
-        """, user.id, user.username, user.first_name)
+        await asyncio.to_thread(_upsert_user_sync, user.id, user.username, user.first_name)
     except Exception as e:
-        logger.error("upsert_user failed: %s", e)
+        logger.error("upsert_user: %s", e)
 
 async def increment_lookup(user_id: int):
-    """Bump lookup counter for a user."""
-    if not db_pool:
-        return
     try:
-        await db_pool.execute("""
-            UPDATE users SET total_lookups = total_lookups + 1,
-                             last_seen     = NOW()
-            WHERE telegram_id = $1
-        """, user_id)
+        await asyncio.to_thread(_increment_lookup_sync, user_id)
     except Exception as e:
-        logger.error("increment_lookup failed: %s", e)
+        logger.error("increment_lookup: %s", e)
 
 async def get_stats() -> dict:
-    """Return aggregate stats for /status."""
-    if not db_pool:
-        return {}
     try:
-        row = await db_pool.fetchrow("""
-            SELECT COUNT(*)                         AS total_users,
-                   COALESCE(SUM(total_lookups), 0)  AS total_lookups,
-                   MAX(last_seen)                   AS last_active
-            FROM users
-        """)
-        return dict(row)
+        return await asyncio.to_thread(_get_stats_sync)
     except Exception as e:
-        logger.error("get_stats failed: %s", e)
+        logger.error("get_stats: %s", e)
         return {}
 
 
@@ -113,9 +144,7 @@ def is_mobile(text: str) -> bool:
 
 def normalize_mobile(text: str) -> str:
     digits = text.replace("+", "").replace(" ", "").replace("-", "")
-    if len(digits) == 10 and digits.isdigit():
-        return "91" + digits
-    return digits
+    return ("91" + digits) if len(digits) == 10 else digits
 
 def fmt(value) -> str:
     return escape(str(value)) if value not in (None, "", [], {}) else "—"
@@ -158,7 +187,7 @@ async def is_member(bot, user_id: int) -> bool:
     except BadRequest:
         return False
     except Exception as e:
-        logger.error("Membership check failed: %s", e)
+        logger.error("Membership check: %s", e)
         return False
 
 def join_keyboard() -> InlineKeyboardMarkup:
@@ -267,7 +296,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_html(update, GUIDANCE)
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Hidden — only ALLOWED_USER_IDS can see it, silently ignored for others
+    # Hidden — silently ignored for non-admins
     if not ALLOWED_USER_IDS or update.effective_user.id not in ALLOWED_USER_IDS:
         return
 
@@ -278,7 +307,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_users   = stats.get("total_users",   "—")
     total_lookups = stats.get("total_lookups", "—")
     last_active   = stats.get("last_active")
-    last_active_str = last_active.strftime("%Y-%m-%d %H:%M UTC") if last_active else "—"
+    last_str      = last_active.strftime("%Y-%m-%d %H:%M UTC") if last_active else "—"
 
     await send_html(update,
         "🟢 <b>Drogon Status</b>\n\n"
@@ -286,7 +315,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏱ <b>Uptime:</b> <code>{uptime}</code>\n\n"
         f"👥 <b>Total users:</b> <code>{total_users}</code>\n"
         f"🔍 <b>Total lookups:</b> <code>{total_lookups}</code>\n"
-        f"🕓 <b>Last active:</b> <code>{last_active_str}</code>\n\n"
+        f"🕓 <b>Last active:</b> <code>{last_str}</code>\n\n"
         f"🐍 <b>Python:</b> <code>{platform.python_version()}</code>"
     )
 
@@ -338,7 +367,6 @@ async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{format_record(data)}"
     )
 
-
 async def send_page(update, context, records, page, query=""):
     total = len(records)
     text = (
@@ -358,7 +386,6 @@ async def send_page(update, context, records, page, query=""):
     else:
         await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
-
 async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -367,7 +394,6 @@ async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = context.user_data.get("query", "")
     if records:
         await send_page(update, context, records, page, query)
-
 
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -390,7 +416,6 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=join_keyboard(),
         )
-
 
 async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❓ Unknown command. Use /help to see usage.")
@@ -422,15 +447,11 @@ async def run_health_server():
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main():
-    global db_pool
-
     await run_health_server()
 
-    # Connect to Neon DB
     try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        await init_db(db_pool)
-        logger.info("Database connected")
+        await init_db()
+        logger.info("Database connected ✅")
     except Exception as e:
         logger.error("Database connection failed: %s — running without DB", e)
 
@@ -449,7 +470,7 @@ async def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lookup))
     application.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-    logger.info("Drogon is running…")
+    logger.info("Drogon is running… 🐉")
     async with application:
         await application.initialize()
         await application.start()
